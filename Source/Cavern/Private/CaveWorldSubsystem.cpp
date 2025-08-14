@@ -15,14 +15,14 @@ UCaveWorldSubsystem::UCaveWorldSubsystem()
     // Default settings
     VoxelSize = 50.0f;
     ChunkSize = 32;
-    ViewDistance = 5;
+    ViewDistance = 7;
     MaxActiveChunks = 2000;
-    ChunksPerFrame = 5;
+    ChunksPerFrame = 10;
     bUseAsyncGeneration = true;
     bDebugDrawChunkBounds = false;
     
     // Generation settings - Large open caves
-    NoiseFrequency = 0.001f;  // Much larger scale for bigger caves
+    NoiseFrequency = 0.002f;  // Much larger scale for bigger caves
     NoiseOctaves = 2;         // Fewer octaves for smoother caves
     NoiseLacunarity = 2.0f;
     NoisePersistence = 0.3f;  // Lower persistence for smoother transitions
