@@ -17,6 +17,13 @@
 static void DeduplicateVerticesAsync(TArray<FVector>& Vertices, TArray<int32>& Triangles, float MergeDistance);
 static void DeduplicateVerticesAsync_Sort(TArray<FVector>& Vertices, TArray<int32>& Triangles, float MergeDistance);
 
+// Helper for edge indexing within a slice for cached marching cubes
+static FORCEINLINE int32 EdgeKey(int32 x, int32 y, int32 z, int32 edge, int32 sampleSize)
+{
+    // Pack x,y,z,edge into an int key; sampleSize <= 129 so 8 bits per coord is enough, but we keep safe shifts
+    return (((z * sampleSize) + y) * sampleSize + x) * 16 + edge;
+}
+
 
 float ACaveChunk::SimplexNoise3D(FVector Position) const
 {
@@ -137,10 +144,10 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 	// Calculate normals and UVs if we have vertices
 	if (Vertices.Num() > 0)
 	{
-		// Only calculate normals if we didn't average them during deduplication
-		if (!bAverageNormalsOnMerge || !bEnableVertexDeduplication)
+		// Ensure normals exist; prefer gradient-based from density
+		if (Normals.Num() != Vertices.Num())
 		{
-			CalculateNormals();
+			CalculateNormalsFromDensity(VoxelSize * 0.5f);
 		}
 		GenerateUVs();
 		
@@ -175,6 +182,22 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 			ProceduralMesh->SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
 		}
 		
+		// Optionally free CPU-side buffers to reduce memory
+		if (!bKeepMeshDataCPU)
+		{
+			Vertices.Empty();
+			Triangles.Empty();
+			Normals.Empty();
+			UVs.Empty();
+			VertexColors.Empty();
+			Tangents.Empty();
+		}
+
+		if (!bKeepDensityField)
+		{
+			DensityField.Empty();
+		}
+
 		UE_LOG(LogTemp, Warning, TEXT("Generated chunk with %d vertices"), Vertices.Num());
 	}
 	
@@ -344,68 +367,26 @@ void ACaveChunk::GenerateDensityField()
 
 void ACaveChunk::GenerateMarchingCubes()
 {
-	// Parallel implementation: split Z-slices and process in parallel, then merge
-	TArray<FVector> CombinedVertices;
-	TArray<int32> CombinedTriangles;
-	CombinedVertices.Reserve(Vertices.Num());
-	CombinedTriangles.Reserve(Triangles.Num());
-
-	// Partition work by Z-slice (exact coverage, no gaps)
-	const int32 NumTasks = FMath::Clamp(ChunkSize, 1, 8); // up to 8 slices parallel
-
-	TArray<TArray<FVector>> TaskVertices;
-	TArray<TArray<int32>> TaskTriangles;
-	TaskVertices.SetNum(NumTasks);
-	TaskTriangles.SetNum(NumTasks);
-
-	// Snapshot immutable inputs for thread safety
+	// Optimized cached edge vertex construction
 	const int32 SampleSize = ChunkSize + 1;
 	const int32 LocalChunkSize = ChunkSize;
 	const float LocalVoxelSize = VoxelSize;
 	const float* DensityPtr = DensityField.GetData();
 
-	ParallelFor(NumTasks, [this, &TaskVertices, &TaskTriangles, NumTasks, DensityPtr, SampleSize, LocalChunkSize, LocalVoxelSize](int32 TaskIndex)
-	{
-		const int32 ZStart = (LocalChunkSize * TaskIndex) / NumTasks;
-		const int32 ZEnd = (LocalChunkSize * (TaskIndex + 1)) / NumTasks;
-		TArray<FVector>& LocalVerts = TaskVertices[TaskIndex];
-		TArray<int32>& LocalTris = TaskTriangles[TaskIndex];
-		
-		for (int32 Z = ZStart; Z < ZEnd; Z++)
-		{
-			for (int32 Y = 0; Y < LocalChunkSize; Y++)
-			{
-				for (int32 X = 0; X < LocalChunkSize; X++)
-				{
-					MarchCubeToBuffers(X, Y, Z, DensityPtr, SampleSize, LocalChunkSize, LocalVoxelSize, LocalVerts, LocalTris);
-				}
-			}
-		}
-	});
-
-	// Merge results and fix indices (single-threaded to avoid races)
-	for (int32 i = 0; i < NumTasks; i++)
-	{
-		const TArray<FVector>& LocalVerts = TaskVertices[i];
-		const TArray<int32>& LocalTris = TaskTriangles[i];
-		
-		const int32 OldVertexCount = CombinedVertices.Num();
-		CombinedVertices.Append(LocalVerts);
-		
-		for (int32 t = 0; t < LocalTris.Num(); t++)
-		{
-			CombinedTriangles.Add(LocalTris[t] + OldVertexCount);
-		}
-	}
+	TArray<FVector> OutVerts;
+	TArray<int32> OutTris;
+	TArray<FVector> OutNormals; // will be recomputed from density later
+	BuildMeshFromDensityFieldCached(DensityPtr, SampleSize, LocalChunkSize, LocalVoxelSize, GetActorLocation(), OutVerts, OutTris, OutNormals);
 
 	// Commit under lock
 	{
 		FScopeLock Lock(&MeshDataMutex);
-		Vertices = MoveTemp(CombinedVertices);
-		Triangles = MoveTemp(CombinedTriangles);
+		Vertices = MoveTemp(OutVerts);
+		Triangles = MoveTemp(OutTris);
+		Normals = MoveTemp(OutNormals);
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("Marching Cubes (parallel) generated %d vertices, %d triangles for chunk %s"), 
+	UE_LOG(LogTemp, Warning, TEXT("Marching Cubes (cached) generated %d vertices, %d triangles for chunk %s"),
 		   Vertices.Num(), Triangles.Num() / 3, *ChunkCoord.ToString());
 }
 
@@ -591,9 +572,10 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 			}
 		}
 
-		// Build mesh off-thread from density field
+		// Build mesh off-thread from density field using cached edges
 		TArray<FVector> TempVertices;
 		TArray<int32> TempTriangles;
+		TArray<FVector> TempNormals;
 
 		// Local static helpers to avoid touching UObject state
 		auto InterpolateVertexLocal = [LocalCaveThreshold](const FVector& P1, const FVector& P2, float V1, float V2) -> FVector
@@ -606,65 +588,9 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 		};
 
 		const float* DensityPtr = TempDensity.GetData();
-		// Sequential extractor to avoid threading hazards
-		for (int32 Z = 0; Z < LocalChunkSize; Z++)
+		if (WeakThis.IsValid())
 		{
-			for (int32 Y = 0; Y < LocalChunkSize; Y++)
-			{
-				for (int32 X = 0; X < LocalChunkSize; X++)
-				{
-					float Corners[8];
-					for (int32 i = 0; i < 8; i++)
-					{
-						const int32 CornerX = X + MarchingCubes::VertexOffsets[i].X;
-						const int32 CornerY = Y + MarchingCubes::VertexOffsets[i].Y;
-						const int32 CornerZ = Z + MarchingCubes::VertexOffsets[i].Z;
-						const int32 Index = CornerX + CornerY * SampleSize + CornerZ * SampleSize * SampleSize;
-						const bool bInBounds = (CornerX >= 0 && CornerX <= LocalChunkSize && CornerY >= 0 && CornerY <= LocalChunkSize && CornerZ >= 0 && CornerZ <= LocalChunkSize);
-						Corners[i] = bInBounds ? DensityPtr[Index] : 1.0f;
-					}
-
-					int32 CubeIndex = 0;
-					for (int32 i = 0; i < 8; i++)
-					{
-						if (Corners[i] < LocalCaveThreshold)
-						{
-							CubeIndex |= (1 << i);
-						}
-					}
-					if (MarchingCubes::EdgeTable[CubeIndex] == 0)
-					{
-						continue;
-					}
-
-					FVector VertexList[12];
-					for (int32 i = 0; i < 12; i++)
-					{
-						if (MarchingCubes::EdgeTable[CubeIndex] & (1 << i))
-						{
-							const int32 Edge1 = MarchingCubes::EdgeConnections[i][0];
-							const int32 Edge2 = MarchingCubes::EdgeConnections[i][1];
-							FVector P1 = FVector(X, Y, Z) + FVector(MarchingCubes::VertexOffsets[Edge1]);
-							FVector P2 = FVector(X, Y, Z) + FVector(MarchingCubes::VertexOffsets[Edge2]);
-							P1 *= LocalVoxelSize;
-							P2 *= LocalVoxelSize;
-							VertexList[i] = InterpolateVertexLocal(P1, P2, Corners[Edge1], Corners[Edge2]);
-						}
-					}
-
-					for (int32 i = 0; MarchingCubes::TriTable[CubeIndex][i] != -1; i += 3)
-					{
-						const int32 Base = TempVertices.Num();
-						TempVertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i]]);
-						TempVertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i + 1]]);
-						TempVertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i + 2]]);
-						// inward-facing winding
-						TempTriangles.Add(Base + 0);
-						TempTriangles.Add(Base + 2);
-						TempTriangles.Add(Base + 1);
-					}
-				}
-			}
+			WeakThis->BuildMeshFromDensityFieldCached(DensityPtr, SampleSize, LocalChunkSize, LocalVoxelSize, CapturedActorLocation, TempVertices, TempTriangles, TempNormals);
 		}
 
 		// Optional dedup on background thread with simple timing
@@ -703,7 +629,7 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 		}
 
 		// Enqueue GPU upload and component updates on game thread
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, TempDen = MoveTemp(TempDensity), SampleSize, Verts = MoveTemp(TempVertices), Tris = MoveTemp(TempTriangles), bDidDedup, DedupBeforeVerts, DedupAfterVerts, DedupMs]() mutable
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, TempDen = MoveTemp(TempDensity), SampleSize, Verts = MoveTemp(TempVertices), Tris = MoveTemp(TempTriangles), Norms = MoveTemp(TempNormals), bDidDedup, DedupBeforeVerts, DedupAfterVerts, DedupMs]() mutable
 		{
 			if (!WeakThis.IsValid())
 			{
@@ -719,6 +645,7 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 			// Assign mesh data from background thread
 			Chunk->Vertices = MoveTemp(Verts);
 			Chunk->Triangles = MoveTemp(Tris);
+			Chunk->Normals = MoveTemp(Norms);
 
 			if (bDidDedup)
 			{
@@ -729,7 +656,11 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 
 			if (Chunk->Vertices.Num() > 0)
 			{
-				Chunk->CalculateNormals();
+				// Normals produced from density gradients; fallback if empty/mismatched
+				if (Chunk->Normals.Num() != Chunk->Vertices.Num())
+				{
+					Chunk->CalculateNormalsFromDensity(Chunk->VoxelSize * 0.5f);
+				}
 				Chunk->GenerateUVs();
 				Chunk->ProceduralMesh->CreateMeshSection(0, Chunk->Vertices, Chunk->Triangles, Chunk->Normals,
 					Chunk->UVs, Chunk->VertexColors, Chunk->Tangents, true);
@@ -752,6 +683,21 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 				Chunk->ProceduralMesh->SetReceivesDecals(true);
 				Chunk->ProceduralMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 				Chunk->ProceduralMesh->SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
+
+				// Optionally free CPU buffers after upload
+				if (!Chunk->bKeepMeshDataCPU)
+				{
+					Chunk->Vertices.Empty();
+					Chunk->Triangles.Empty();
+					Chunk->Normals.Empty();
+					Chunk->UVs.Empty();
+					Chunk->VertexColors.Empty();
+					Chunk->Tangents.Empty();
+				}
+				if (!Chunk->bKeepDensityField)
+				{
+					Chunk->DensityField.Empty();
+				}
 			}
 
 			Chunk->bIsGenerating = false;
@@ -904,6 +850,178 @@ void ACaveChunk::CalculateNormals()
 	});
 }
 
+FVector ACaveChunk::ComputeDensityGradient(const FVector& WorldPosition, float Epsilon) const
+{
+    // Central differences sampling GenerateDensityAt in world space
+    const FVector Ex(Epsilon, 0, 0);
+    const FVector Ey(0, Epsilon, 0);
+    const FVector Ez(0, 0, Epsilon);
+
+    const float dx = GenerateDensityAt(WorldPosition + Ex) - GenerateDensityAt(WorldPosition - Ex);
+    const float dy = GenerateDensityAt(WorldPosition + Ey) - GenerateDensityAt(WorldPosition - Ey);
+    const float dz = GenerateDensityAt(WorldPosition + Ez) - GenerateDensityAt(WorldPosition - Ez);
+
+    const FVector g(dx, dy, dz);
+    return -g.GetSafeNormal(); // negative gradient points from solid to empty for iso-surface
+}
+
+void ACaveChunk::CalculateNormalsFromDensity(float Epsilon)
+{
+    Normals.SetNum(Vertices.Num());
+    const FVector ActorLoc = GetActorLocation();
+    ParallelFor(Vertices.Num(), [this, ActorLoc, Epsilon](int32 i)
+    {
+        const FVector WorldV = ActorLoc + Vertices[i];
+        Normals[i] = ComputeDensityGradient(WorldV, Epsilon);
+    });
+}
+
+void ACaveChunk::BuildMeshFromDensityFieldCached(const float* DensityData, int32 SampleSize, int32 LocalChunkSize, float LocalVoxelSize, const FVector& ActorLocation,
+                                                TArray<FVector>& OutVertices, TArray<int32>& OutTriangles, TArray<FVector>& OutNormals) const
+{
+    OutVertices.Reset();
+    OutTriangles.Reset();
+    OutNormals.Reset();
+    const int32 CellCount = LocalChunkSize * LocalChunkSize * LocalChunkSize;
+    OutVertices.Reserve(CellCount * 3);
+    OutTriangles.Reserve(CellCount * 6);
+
+    // Edge caches for a single Z slice: 3 edges per voxel (X-edge, Y-edge, Z-edge)
+    TMap<int32, int32> EdgeVertexCache; // key -> vertex index
+    EdgeVertexCache.Reserve(LocalChunkSize * LocalChunkSize * 3);
+
+    auto Sample = [DensityData, SampleSize, LocalChunkSize](int32 x, int32 y, int32 z) -> float
+    {
+        // Clamp to bounds to avoid OOB
+        x = FMath::Clamp(x, 0, LocalChunkSize);
+        y = FMath::Clamp(y, 0, LocalChunkSize);
+        z = FMath::Clamp(z, 0, LocalChunkSize);
+        return DensityData[x + y * SampleSize + z * SampleSize * SampleSize];
+    };
+
+    const float LocalThreshold = CaveThreshold;
+    auto Interp = [LocalThreshold](const FVector& P1, const FVector& P2, float V1, float V2) -> FVector
+    {
+        if (FMath::Abs(LocalThreshold - V1) < 0.00001f) return P1;
+        if (FMath::Abs(LocalThreshold - V2) < 0.00001f) return P2;
+        if (FMath::Abs(V1 - V2) < 0.00001f) return P1;
+        const float T = (LocalThreshold - V1) / (V2 - V1);
+        return P1 + T * (P2 - P1);
+    };
+
+    for (int32 z = 0; z < LocalChunkSize; ++z)
+    {
+        for (int32 y = 0; y < LocalChunkSize; ++y)
+        {
+            for (int32 x = 0; x < LocalChunkSize; ++x)
+            {
+                float c[8];
+                for (int i = 0; i < 8; ++i)
+                {
+                    const int32 cx = x + MarchingCubes::VertexOffsets[i].X;
+                    const int32 cy = y + MarchingCubes::VertexOffsets[i].Y;
+                    const int32 cz = z + MarchingCubes::VertexOffsets[i].Z;
+                    c[i] = Sample(cx, cy, cz);
+                }
+
+                const int32 cubeIndex = GetCubeConfiguration(c);
+                const int32 edges = MarchingCubes::EdgeTable[cubeIndex];
+                if (edges == 0) { continue; }
+
+                int32 vlist[12];
+
+                auto GetOrCreateEdgeVertex = [&](int ex, int ey, int ez, int axis, const FVector& P1, const FVector& P2, float V1, float V2) -> int32
+                {
+                    const int32 key = EdgeKey(ex, ey, ez, axis, SampleSize);
+                    if (int32* found = EdgeVertexCache.Find(key))
+                    {
+                        return *found;
+                    }
+                    const FVector pos = Interp(P1, P2, V1, V2);
+                    const int32 idx = OutVertices.Add(pos);
+                    EdgeVertexCache.Add(key, idx);
+                    return idx;
+                };
+
+                // Compute up to 12 edge vertices
+                for (int i = 0; i < 12; ++i)
+                {
+                    if (edges & (1 << i))
+                    {
+                        const int e1 = MarchingCubes::EdgeConnections[i][0];
+                        const int e2 = MarchingCubes::EdgeConnections[i][1];
+                        FVector P1 = FVector(x, y, z) + FVector(MarchingCubes::VertexOffsets[e1]);
+                        FVector P2 = FVector(x, y, z) + FVector(MarchingCubes::VertexOffsets[e2]);
+                        P1 *= LocalVoxelSize;
+                        P2 *= LocalVoxelSize;
+
+                        const float V1 = c[e1];
+                        const float V2 = c[e2];
+
+                        // Determine cache anchor (lowest of the two corner coords) for stability
+                        const FIntVector v1o = MarchingCubes::VertexOffsets[e1];
+                        const FIntVector v2o = MarchingCubes::VertexOffsets[e2];
+                        const FIntVector d = v2o - v1o;
+                        const int axis = (d.X != 0) ? 0 : ((d.Y != 0) ? 1 : 2);
+                        const FIntVector a = FIntVector(x, y, z) + FIntVector(FMath::Min(v1o.X, v2o.X), FMath::Min(v1o.Y, v2o.Y), FMath::Min(v1o.Z, v2o.Z));
+                        const int32 vidx = GetOrCreateEdgeVertex(a.X, a.Y, a.Z, axis, P1, P2, V1, V2);
+                        vlist[i] = vidx;
+                    }
+                }
+
+                // Emit triangles
+                for (int i = 0; MarchingCubes::TriTable[cubeIndex][i] != -1; i += 3)
+                {
+                    const int ai = vlist[MarchingCubes::TriTable[cubeIndex][i + 0]];
+                    const int bi = vlist[MarchingCubes::TriTable[cubeIndex][i + 1]];
+                    const int ci = vlist[MarchingCubes::TriTable[cubeIndex][i + 2]];
+                    // inward-facing winding
+                    OutTriangles.Add(ai);
+                    OutTriangles.Add(ci);
+                    OutTriangles.Add(bi);
+                }
+            }
+        }
+    }
+
+    // Compute normals from density gradient in world-space
+    if (OutVertices.Num() == 0)
+    {
+        OutNormals.Reset();
+        return;
+    }
+    OutNormals.SetNum(OutVertices.Num());
+    const float eps = LocalVoxelSize * 0.5f;
+
+    auto DensityAtLocal = [](const FVector& WorldPosition) -> float
+    {
+        // Match GenerateDensityAt without accessing 'this'
+        const FVector NoisePos = WorldPosition * 0.002f;
+        float Density = 0.0f;
+        Density += FMath::PerlinNoise3D(NoisePos * 0.3f) * 1.0f;
+        Density += FMath::PerlinNoise3D(NoisePos * 0.8f) * 0.3f;
+        Density = -Density;
+        Density += 0.2f;
+        const float HeightGradient = (WorldPosition.Z - 5000.0f) / 20000.0f;
+        Density += HeightGradient * 0.2f;
+        const float ChamberNoise = FMath::PerlinNoise3D(NoisePos * 0.05f);
+        if (ChamberNoise < -0.1f) { Density -= 1.5f; }
+        const float TunnelNoise = FMath::PerlinNoise3D(NoisePos * 0.1f);
+        if (TunnelNoise < -0.2f) { Density -= 0.8f; }
+        return Density;
+    };
+
+    for (int32 i = 0; i < OutVertices.Num(); ++i)
+    {
+        const FVector worldPos = ActorLocation + OutVertices[i];
+        const FVector Ex(eps, 0, 0), Ey(0, eps, 0), Ez(0, 0, eps);
+        const float dx = DensityAtLocal(worldPos + Ex) - DensityAtLocal(worldPos - Ex);
+        const float dy = DensityAtLocal(worldPos + Ey) - DensityAtLocal(worldPos - Ey);
+        const float dz = DensityAtLocal(worldPos + Ez) - DensityAtLocal(worldPos - Ez);
+        OutNormals[i] = -FVector(dx, dy, dz).GetSafeNormal();
+    }
+}
+
 void ACaveChunk::GenerateUVs()
 {
 	UVs.SetNum(Vertices.Num());
@@ -913,8 +1031,9 @@ void ACaveChunk::GenerateUVs()
 	{
 		FVector Vertex = Vertices[i];
 		
-		// For now, simple UV based on world position
-		UVs[i] = FVector2D(Vertex.X * 0.01f, Vertex.Y * 0.01f);
+		// For now, simple UV based on world position (avoid seams across chunks)
+		const FVector WorldV = GetActorLocation() + Vertex;
+		UVs[i] = FVector2D(WorldV.X * 0.01f, WorldV.Y * 0.01f);
 	}
 }
 

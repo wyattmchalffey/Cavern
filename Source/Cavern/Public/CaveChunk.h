@@ -92,7 +92,7 @@ public:
 
 	// Only run (costly) deduplication when vertex count exceeds this threshold
 	UPROPERTY(EditAnywhere, Category = "Cave|Optimization", meta = (ClampMin = "0"))
-	int32 MinVerticesForDeduplication = 0;
+	int32 MinVerticesForDeduplication = 80000; // Avoid dedup cost for smaller chunks
 
 	// Prefer sort-based dedup (usually faster) over hash-based
 	UPROPERTY(EditAnywhere, Category = "Cave|Optimization")
@@ -147,6 +147,12 @@ private:
 	void MarchCubeToBuffers(int32 X, int32 Y, int32 Z,
 							const float* DensityData, int32 SampleSize, int32 LocalChunkSize, float LocalVoxelSize,
 							TArray<FVector>& OutVertices, TArray<int32>& OutTriangles);
+
+	// Optimized mesh construction and normals
+	void BuildMeshFromDensityFieldCached(const float* DensityData, int32 SampleSize, int32 LocalChunkSize, float LocalVoxelSize, const FVector& ActorLocation,
+											 TArray<FVector>& OutVertices, TArray<int32>& OutTriangles, TArray<FVector>& OutNormals) const;
+	FVector ComputeDensityGradient(const FVector& WorldPosition, float Epsilon) const;
+	void CalculateNormalsFromDensity(float Epsilon);
 	
 	// Nanite static mesh generation
 	void BuildNaniteStaticMesh();
@@ -154,6 +160,13 @@ private:
 	// Rendering mode
 	UPROPERTY(EditAnywhere, Category = "Cave|Rendering")
 	bool bUseNaniteStaticMesh = false;
+
+	// Memory retention options
+	UPROPERTY(EditAnywhere, Category = "Cave|Memory")
+	bool bKeepMeshDataCPU = false; // Keep CPU-side arrays after creating mesh section
+
+	UPROPERTY(EditAnywhere, Category = "Cave|Memory")
+	bool bKeepDensityField = false; // Keep density field after mesh build
 	
 	// Helper functions (ADD THESE!)
 	FVector InterpolateVertex(FVector P1, FVector P2, float V1, float V2) const;
