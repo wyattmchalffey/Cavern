@@ -14,10 +14,10 @@ UCaveWorldSubsystem::UCaveWorldSubsystem()
 {
     // Default settings
     VoxelSize = 50.0f;
-    ChunkSize = 32;
-    ViewDistance = 7;
+    ChunkSize = 64;
+    ViewDistance = 5;
     MaxActiveChunks = 2000;
-    ChunksPerFrame = 10;
+    ChunksPerFrame = 5;
     bUseAsyncGeneration = true;
     bDebugDrawChunkBounds = false;
     

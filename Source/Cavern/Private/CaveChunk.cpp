@@ -15,6 +15,7 @@
 
 // Forward declaration for async dedup helper
 static void DeduplicateVerticesAsync(TArray<FVector>& Vertices, TArray<int32>& Triangles, float MergeDistance);
+static void DeduplicateVerticesAsync_Sort(TArray<FVector>& Vertices, TArray<int32>& Triangles, float MergeDistance);
 
 
 float ACaveChunk::SimplexNoise3D(FVector Position) const
@@ -666,14 +667,43 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 			}
 		}
 
-		// Optional dedup on background thread
+		// Optional dedup on background thread with simple timing
+		int32 DedupBeforeVerts = TempVertices.Num();
+		int32 DedupAfterVerts = TempVertices.Num();
+		double DedupMs = 0.0;
+		bool bDidDedup = false;
 		if (bLocalEnableDedup && TempVertices.Num() > 0)
 		{
-			DeduplicateVerticesAsync(TempVertices, TempTriangles, LocalMergeDistance);
+			// Skip if below threshold captured from object on game-thread (0 means always)
+			int32 Threshold = 0;
+			if (WeakThis.IsValid())
+			{
+				Threshold = WeakThis->MinVerticesForDeduplication;
+			}
+			if (Threshold == 0 || DedupBeforeVerts >= Threshold)
+			{
+				const double StartTime = FPlatformTime::Seconds();
+				bool bSortBased = true;
+				if (WeakThis.IsValid())
+				{
+					bSortBased = WeakThis->bUseSortBasedDeduplication;
+				}
+				if (bSortBased)
+				{
+					DeduplicateVerticesAsync_Sort(TempVertices, TempTriangles, LocalMergeDistance);
+				}
+				else
+				{
+					DeduplicateVerticesAsync(TempVertices, TempTriangles, LocalMergeDistance);
+				}
+				DedupMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+				DedupAfterVerts = TempVertices.Num();
+				bDidDedup = true;
+			}
 		}
 
 		// Enqueue GPU upload and component updates on game thread
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, TempDen = MoveTemp(TempDensity), SampleSize, Verts = MoveTemp(TempVertices), Tris = MoveTemp(TempTriangles)]() mutable
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, TempDen = MoveTemp(TempDensity), SampleSize, Verts = MoveTemp(TempVertices), Tris = MoveTemp(TempTriangles), bDidDedup, DedupBeforeVerts, DedupAfterVerts, DedupMs]() mutable
 		{
 			if (!WeakThis.IsValid())
 			{
@@ -689,6 +719,13 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 			// Assign mesh data from background thread
 			Chunk->Vertices = MoveTemp(Verts);
 			Chunk->Triangles = MoveTemp(Tris);
+
+			if (bDidDedup)
+			{
+				const float ReductionPct = (DedupBeforeVerts > 0) ? (1.0f - (float)DedupAfterVerts / (float)DedupBeforeVerts) * 100.0f : 0.0f;
+				UE_LOG(LogTemp, Warning, TEXT("Vertex Deduplication (Async): %d -> %d vertices (%.1f%% reduction) in %.2fms"),
+					DedupBeforeVerts, DedupAfterVerts, ReductionPct, (float)DedupMs);
+			}
 
 			if (Chunk->Vertices.Num() > 0)
 			{
@@ -1143,4 +1180,70 @@ static void DeduplicateVerticesAsync(TArray<FVector>& Vertices, TArray<int32>& T
 	}
 
 	Vertices = MoveTemp(UniqueVertices);
+}
+
+// Faster sort-based dedup suitable for async use (quantize + sort + unique)
+static void DeduplicateVerticesAsync_Sort(TArray<FVector>& Vertices, TArray<int32>& Triangles, float MergeDistance)
+{
+    if (Vertices.Num() == 0 || Triangles.Num() == 0)
+    {
+        return;
+    }
+
+    const float InvGrid = (MergeDistance > 0.0f) ? (1.0f / MergeDistance) : 1e6f;
+
+    struct FQuantizedVertex
+    {
+        int32 Qx;
+        int32 Qy;
+        int32 Qz;
+        int32 OriginalIndex;
+    };
+
+    TArray<FQuantizedVertex> Q; Q.Reserve(Vertices.Num());
+    for (int32 i = 0; i < Vertices.Num(); ++i)
+    {
+        const FVector& V = Vertices[i];
+        FQuantizedVertex E{ FMath::RoundToInt(V.X * InvGrid), FMath::RoundToInt(V.Y * InvGrid), FMath::RoundToInt(V.Z * InvGrid), i };
+        Q.Add(E);
+    }
+
+    Q.Sort([](const FQuantizedVertex& A, const FQuantizedVertex& B)
+    {
+        if (A.Qx != B.Qx) return A.Qx < B.Qx;
+        if (A.Qy != B.Qy) return A.Qy < B.Qy;
+        if (A.Qz != B.Qz) return A.Qz < B.Qz;
+        return A.OriginalIndex < B.OriginalIndex;
+    });
+
+    TArray<int32> Remap; Remap.SetNumUninitialized(Vertices.Num());
+    TArray<FVector> Unique; Unique.Reserve(Vertices.Num());
+
+    int32 CurrentUniqueIndex = -1;
+    int32 i = 0;
+    while (i < Q.Num())
+    {
+        const int32 Start = i;
+        const int32 Qx = Q[i].Qx, Qy = Q[i].Qy, Qz = Q[i].Qz;
+        ++i;
+        while (i < Q.Num() && Q[i].Qx == Qx && Q[i].Qy == Qy && Q[i].Qz == Qz)
+        {
+            ++i;
+        }
+
+        ++CurrentUniqueIndex;
+        const FVector& Representative = Vertices[Q[Start].OriginalIndex];
+        Unique.Add(Representative);
+        for (int32 k = Start; k < i; ++k)
+        {
+            Remap[Q[k].OriginalIndex] = CurrentUniqueIndex;
+        }
+    }
+
+    for (int32& Idx : Triangles)
+    {
+        Idx = Remap[Idx];
+    }
+
+    Vertices = MoveTemp(Unique);
 }

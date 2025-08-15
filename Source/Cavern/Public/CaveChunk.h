@@ -89,6 +89,14 @@ public:
 	
 	UPROPERTY(EditAnywhere, Category = "Cave|Optimization")
 	bool bAverageNormalsOnMerge = true;  // Average normals for smooth shading
+
+	// Only run (costly) deduplication when vertex count exceeds this threshold
+	UPROPERTY(EditAnywhere, Category = "Cave|Optimization", meta = (ClampMin = "0"))
+	int32 MinVerticesForDeduplication = 0;
+
+	// Prefer sort-based dedup (usually faster) over hash-based
+	UPROPERTY(EditAnywhere, Category = "Cave|Optimization")
+	bool bUseSortBasedDeduplication = true;
 	
 protected:
 	virtual void BeginPlay() override;
