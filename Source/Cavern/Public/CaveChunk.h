@@ -3,7 +3,6 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "ProceduralMeshComponent.h"
-#include "Components/StaticMeshComponent.h"
 #include "CaveChunk.generated.h"
 
 USTRUCT()
@@ -57,12 +56,6 @@ public:
 	void GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize, int32 InChunkSize);
 	
 	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
-	void BuildMeshOnGameThread();
-	
-	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
-	void ModifyTerrain(FVector WorldLocation, float Radius, float Strength);
-	
-	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
 	void ResetChunk();
 	
 	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
@@ -72,9 +65,6 @@ public:
 	
 	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
 	void ClearMesh();
-	
-	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
-	void SetLODLevel(int32 LODLevel);
 
 	// Generation state accessor to prevent pooling/destroy during builds
 	UFUNCTION(BlueprintCallable, Category = "Cave Chunk")
@@ -97,6 +87,30 @@ public:
 	// Prefer sort-based dedup (usually faster) over hash-based
 	UPROPERTY(EditAnywhere, Category = "Cave|Optimization")
 	bool bUseSortBasedDeduplication = true;
+
+	// Optional material override applied to the procedural mesh
+	UPROPERTY(EditAnywhere, Category = "Cave|Rendering")
+	UMaterialInterface* CaveMaterialOverride = nullptr;
+
+	// Memory retention options
+	UPROPERTY(EditAnywhere, Category = "Cave|Memory")
+	bool bKeepMeshDataCPU = true; // Keep CPU-side arrays after creating mesh section
+
+	UPROPERTY(EditAnywhere, Category = "Cave|Memory")
+	bool bKeepDensityField = true; // Keep density field after mesh build
+
+	// Smoothing settings
+    UPROPERTY(EditAnywhere, Category = "Cave|Smoothing", meta = (ClampMin = "0", ClampMax = "20"))
+    int32 SmoothingIterations = 5;
+    
+    UPROPERTY(EditAnywhere, Category = "Cave|Smoothing")
+    bool bEnableSmoothing = true;
+    
+    UPROPERTY(EditAnywhere, Category = "Cave|Smoothing", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float SmoothingLambda = 0.5f;
+    
+    UPROPERTY(EditAnywhere, Category = "Cave|Smoothing", meta = (ClampMin = "-1.0", ClampMax = "0.0"))
+    float SmoothingMu = -0.53f;
 	
 protected:
 	virtual void BeginPlay() override;
@@ -105,33 +119,24 @@ private:
 	UPROPERTY(VisibleAnywhere)
 	UProceduralMeshComponent* ProceduralMesh;
 	
-	UPROPERTY(VisibleAnywhere)
-	UStaticMeshComponent* StaticMeshComponent;
-	
-	// Optional material override applied to the procedural mesh
-	UPROPERTY(EditAnywhere, Category = "Cave|Rendering")
-	UMaterialInterface* CaveMaterialOverride = nullptr;
-	
 	FIntVector ChunkCoord;
 	float VoxelSize;
 	int32 ChunkSize;
 	
 	// Safety and state tracking
 	bool bIsGenerating;
-	FCriticalSection MeshDataMutex;  // ADD THIS!
+	FCriticalSection MeshDataMutex;
 	
 	// Mesh data
 	TArray<FVector> Vertices;
 	TArray<int32> Triangles;
 	TArray<FVector> Normals;
 	TArray<FVector2D> UVs;
-	TArray<FColor> VertexColors;
-	TArray<FProcMeshTangent> Tangents;
 	
 	// Density field for marching cubes
 	TArray<float> DensityField;
 	
-	// Generation parameters (ADD THESE!)
+	// Generation parameters
 	float NoiseFrequency = 0.001f;  // Large scale for big caves
 	int32 NoiseOctaves = 2;         // Fewer octaves for smoother caves
 	float NoiseLacunarity = 2.0f;
@@ -139,42 +144,20 @@ private:
 	float CaveThreshold = 0.1f;    // More open space
 	
 	// Generation functions
-	float SampleDensity(FVector LocalPosition);
-	float GenerateDensityAt(FVector WorldPosition) const;  // ADD THIS!
+	float GenerateDensityAt(FVector WorldPosition) const;
 	void GenerateDensityField();
 	void GenerateMarchingCubes();
-	void MarchCube(int32 X, int32 Y, int32 Z);  // CHANGE PARAMETER TYPE!
-	void MarchCubeToBuffers(int32 X, int32 Y, int32 Z,
-							const float* DensityData, int32 SampleSize, int32 LocalChunkSize, float LocalVoxelSize,
-							TArray<FVector>& OutVertices, TArray<int32>& OutTriangles);
-
+	
 	// Optimized mesh construction and normals
 	void BuildMeshFromDensityFieldCached(const float* DensityData, int32 SampleSize, int32 LocalChunkSize, float LocalVoxelSize, const FVector& ActorLocation,
 											 TArray<FVector>& OutVertices, TArray<int32>& OutTriangles, TArray<FVector>& OutNormals) const;
 	FVector ComputeDensityGradient(const FVector& WorldPosition, float Epsilon) const;
 	void CalculateNormalsFromDensity(float Epsilon);
 	
-	// Nanite static mesh generation
-	void BuildNaniteStaticMesh();
-	
-	// Rendering mode
-	UPROPERTY(EditAnywhere, Category = "Cave|Rendering")
-	bool bUseNaniteStaticMesh = false;
-
-	// Memory retention options
-	UPROPERTY(EditAnywhere, Category = "Cave|Memory")
-	bool bKeepMeshDataCPU = false; // Keep CPU-side arrays after creating mesh section
-
-	UPROPERTY(EditAnywhere, Category = "Cave|Memory")
-	bool bKeepDensityField = false; // Keep density field after mesh build
-	
-	// Helper functions (ADD THESE!)
+	// Helper functions
 	FVector InterpolateVertex(FVector P1, FVector P2, float V1, float V2) const;
 	int32 GetCubeConfiguration(float Corners[8]) const;
-	float SimplexNoise3D(FVector Position) const;
-	float FractalNoise(FVector Position, int32 Octaves, float Frequency, 
-					  float Lacunarity, float Persistence) const;
-	void CalculateNormals();
+	float PerlinNoise3D(FVector Position) const;
 	void GenerateUVs();
 
 	// Deduplication methods
@@ -182,8 +165,9 @@ private:
 	void DeduplicateVerticesWithNormalAveraging();
 	void RemapTriangleIndices(const TArray<int32>& RemapTable);
 
-	// Debug stats
-	int32 VerticesBeforeDedup = 0;
-	int32 VerticesAfterDedup = 0;
-	float DeduplicationTime = 0.0f;
+	void ApplyTaubinSmoothing(TArray<FVector>& InOutVertices, const TArray<int32>& InTriangles, 
+		float Lambda = 0.5f, float Mu = -0.53f, int32 Iterations = 10);
+		
+	static void ApplyTaubinSmoothingStatic(TArray<FVector>& InOutVertices, const TArray<int32>& InTriangles,
+					 float Lambda, float Mu, int32 Iterations);
 };

@@ -22,9 +22,6 @@ struct FChunkData
     UPROPERTY(BlueprintReadOnly)
     bool bIsGenerated = false;
     
-    UPROPERTY(BlueprintReadOnly)
-    bool bNeedsRebuild = false;
-    
     UPROPERTY()
     class ACaveChunk* ChunkActor = nullptr;
     
@@ -33,9 +30,6 @@ struct FChunkData
     
     UPROPERTY()
     float LastAccessTime = 0.0f;
-    
-    UPROPERTY()
-    int32 CurrentLOD = 0;
 };
 
 USTRUCT()
@@ -72,12 +66,6 @@ public:
     
     UFUNCTION(BlueprintCallable, Category = "Cave System")
     void UpdateAroundPlayer(FVector PlayerLocation);
-    
-    UFUNCTION(BlueprintCallable, Category = "Cave System")
-    void ModifyTerrainAt(FVector WorldLocation, float Radius, float Strength);
-    
-    UFUNCTION(BlueprintPure, Category = "Cave System")
-    float SampleDensityAt(FVector WorldLocation) const;
     
     UFUNCTION(BlueprintCallable, Category = "Cave System")
     void RegenerateAllChunks();
@@ -146,7 +134,6 @@ protected:
     // Internal update functions
     void TickUpdate();
     void ProcessGenerationQueue();
-    void UpdateChunkLODs();
     void CleanupDistantChunks(const TSet<FIntVector>& RequiredChunks);
     void CleanupAllChunks();
     

@@ -1,11 +1,6 @@
 #include "CaveChunk.h"
 #include "ProceduralMeshComponent.h"
 #include "Materials/Material.h"
-#include "StaticMeshResources.h"
-#include "StaticMeshAttributes.h"
-#include "Engine/StaticMesh.h"
-#include "Rendering/NaniteResources.h"
-#include "StaticMeshOperations.h"
 #include "MarchingCubesTables.h"
 #include "Engine/World.h"
 #include "Engine/CollisionProfile.h"
@@ -24,8 +19,7 @@ static FORCEINLINE int32 EdgeKey(int32 x, int32 y, int32 z, int32 edge, int32 sa
     return (((z * sampleSize) + y) * sampleSize + x) * 16 + edge;
 }
 
-
-float ACaveChunk::SimplexNoise3D(FVector Position) const
+float ACaveChunk::PerlinNoise3D(FVector Position) const
 {
 	// Better 3D noise implementation
 	float X = Position.X * 0.01f;
@@ -49,11 +43,6 @@ ACaveChunk::ACaveChunk()
 	ProceduralMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("ProceduralMesh"));
 	RootComponent = ProceduralMesh;
 	ProceduralMesh->bUseAsyncCooking = true;
-	
-	StaticMeshComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StaticMesh"));
-	StaticMeshComponent->SetupAttachment(RootComponent);
-	StaticMeshComponent->SetMobility(EComponentMobility::Movable);
-	StaticMeshComponent->SetVisibility(false);
 	
 	// Enable proper lighting
 	ProceduralMesh->SetCastShadow(true);
@@ -114,16 +103,16 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 	SetActorLocation(WorldPosition);
 	
 	// Generate density field first!
-	GenerateDensityField();  // ADD THIS
+	GenerateDensityField();
 	
 	// Generate the mesh
 	GenerateMarchingCubes();
 
-	// NEW: Apply vertex deduplication before creating the mesh section
+	// Apply vertex deduplication before creating the mesh section
 	if (bEnableVertexDeduplication && Vertices.Num() > 0)
 	{
 		double StartTime = FPlatformTime::Seconds();
-		VerticesBeforeDedup = Vertices.Num();
+		int32 VerticesBeforeDedup = Vertices.Num();
 		if (bAverageNormalsOnMerge)
 		{
 			DeduplicateVerticesWithNormalAveraging();
@@ -132,8 +121,8 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 		{
 			DeduplicateVertices();
 		}
-		VerticesAfterDedup = Vertices.Num();
-		DeduplicationTime = (FPlatformTime::Seconds() - StartTime) * 1000.0f;
+		int32 VerticesAfterDedup = Vertices.Num();
+		float DeduplicationTime = (FPlatformTime::Seconds() - StartTime) * 1000.0f;
 		UE_LOG(LogTemp, Warning, TEXT("Vertex Deduplication: %d -> %d vertices (%.1f%% reduction) in %.2fms"),
 			VerticesBeforeDedup,
 			VerticesAfterDedup,
@@ -151,36 +140,28 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 		}
 		GenerateUVs();
 		
-		if (bUseNaniteStaticMesh)
+		// Use procedural mesh path
+		ProceduralMesh->CreateMeshSection(
+			0,
+			Vertices,
+			Triangles,
+			Normals,
+			UVs,
+			TArray<FColor>(),  // Empty vertex colors
+			TArray<FProcMeshTangent>(),  // Empty tangents
+			true
+		);
+		
+		if (CaveMaterialOverride)
 		{
-			// Use Nanite path
-			BuildNaniteStaticMesh();
+			ProceduralMesh->SetMaterial(0, CaveMaterialOverride);
 		}
-		else
-		{
-			// Use procedural mesh path
-			ProceduralMesh->CreateMeshSection(
-				0,
-				Vertices,
-				Triangles,
-				Normals,
-				UVs,
-				VertexColors,
-				Tangents,
-				true
-			);
-			
-			if (CaveMaterialOverride)
-			{
-				ProceduralMesh->SetMaterial(0, CaveMaterialOverride);
-			}
-			
-			// Enable proper lighting on the procedural mesh
-			ProceduralMesh->SetCastShadow(true);
-			ProceduralMesh->SetReceivesDecals(true);
-			ProceduralMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-			ProceduralMesh->SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
-		}
+		
+		// Enable proper lighting on the procedural mesh
+		ProceduralMesh->SetCastShadow(true);
+		ProceduralMesh->SetReceivesDecals(true);
+		ProceduralMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		ProceduralMesh->SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
 		
 		// Optionally free CPU-side buffers to reduce memory
 		if (!bKeepMeshDataCPU)
@@ -189,8 +170,6 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 			Triangles.Empty();
 			Normals.Empty();
 			UVs.Empty();
-			VertexColors.Empty();
-			Tangents.Empty();
 		}
 
 		if (!bKeepDensityField)
@@ -202,100 +181,6 @@ void ACaveChunk::GenerateMesh(FIntVector ChunkCoordinate, float InVoxelSize, int
 	}
 	
 	bIsGenerating = false;
-}
-void ACaveChunk::BuildNaniteStaticMesh()
-{
-	// Build a transient UStaticMesh from current vertex/index data and enable Nanite
-	if (!StaticMeshComponent)
-	{
-		return;
-	}
-
-	// Hide PMC, show StaticMesh
-	ProceduralMesh->SetVisibility(false);
-	StaticMeshComponent->SetVisibility(true);
-
-	UStaticMesh* NewMesh = NewObject<UStaticMesh>(this, NAME_None, RF_Transient);
-	if (!NewMesh)
-	{
-		return;
-	}
-
-	FMeshDescription MeshDesc;
-	FStaticMeshAttributes Attributes(MeshDesc);
-	Attributes.Register();
-	TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
-	TPolygonGroupAttributesRef<FName> MaterialSlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
-	// Optional attributes not required for initial build
-	FPolygonGroupID PolyGroup = MeshDesc.CreatePolygonGroup();
-	MaterialSlotNames[PolyGroup] = FName("Cave");
-
-	// Create vertices
-	TArray<FVertexID> VertexIDs;
-	VertexIDs.Reserve(Vertices.Num());
-	for (const FVector& V : Vertices)
-	{
-		const FVertexID Vid = MeshDesc.CreateVertex();
-		Positions[Vid] = (FVector3f)V;
-		VertexIDs.Add(Vid);
-	}
-
-	// Create triangles
-	for (int32 t = 0; t < Triangles.Num(); t += 3)
-	{
-		const int32 I0 = Triangles[t + 0];
-		const int32 I1 = Triangles[t + 1];
-		const int32 I2 = Triangles[t + 2];
-
-		FVertexInstanceID VI0 = MeshDesc.CreateVertexInstance(FVertexID(I0));
-		FVertexInstanceID VI1 = MeshDesc.CreateVertexInstance(FVertexID(I1));
-		FVertexInstanceID VI2 = MeshDesc.CreateVertexInstance(FVertexID(I2));
-
-		TArray<FVertexInstanceID> Inst;
-		Inst.SetNumUninitialized(3);
-		Inst[0] = VI0;
-		Inst[1] = VI2; // inward winding
-		Inst[2] = VI1;
-		MeshDesc.CreatePolygon(PolyGroup, Inst);
-	}
-
-	// Configure Nanite before build
-	NewMesh->NaniteSettings.bEnabled = true;
-	NewMesh->NaniteSettings.bPreserveArea = true;
-	
-	// Commit and build static mesh
-	NewMesh->CommitMeshDescription(0);
-	TArray<FText> BuildErrors;
-	NewMesh->Build(false, &BuildErrors);
-	NewMesh->CalculateExtendedBounds();
-
-	// Assign
-	StaticMeshComponent->SetStaticMesh(NewMesh);
-	StaticMeshComponent->SetCastShadow(true);
-	StaticMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	if (CaveMaterialOverride)
-	{
-		StaticMeshComponent->SetMaterial(0, CaveMaterialOverride);
-	}
-}
-
-float ACaveChunk::SampleDensity(FVector LocalPosition)
-{
-	FVector WorldPos = GetActorLocation() + LocalPosition;
-	
-	// Create a simple cave shape using noise
-	float noise = SimplexNoise3D(WorldPos * 0.005f);
-	
-	// Add a second octave
-	noise += SimplexNoise3D(WorldPos * 0.01f) * 0.5f;
-	
-	// Create cave by inverting
-	float density = -noise;
-	
-	// Add a ground plane
-	density += (WorldPos.Z / 1000.0f);
-	
-	return density;
 }
 
 float ACaveChunk::GenerateDensityAt(FVector WorldPosition) const
@@ -390,127 +275,6 @@ void ACaveChunk::GenerateMarchingCubes()
 		   Vertices.Num(), Triangles.Num() / 3, *ChunkCoord.ToString());
 }
 
-void ACaveChunk::MarchCube(int32 X, int32 Y, int32 Z)
-{
-	// Get the 8 corner values of the cube from the density field
-	float Corners[8];
-	for (int32 i = 0; i < 8; i++)
-	{
-		int32 CornerX = X + MarchingCubes::VertexOffsets[i].X;
-		int32 CornerY = Y + MarchingCubes::VertexOffsets[i].Y;
-		int32 CornerZ = Z + MarchingCubes::VertexOffsets[i].Z;
-		
-		int32 Index = CornerX + CornerY * (ChunkSize + 1) + 
-				  CornerZ * (ChunkSize + 1) * (ChunkSize + 1);
-		
-		if (DensityField.IsValidIndex(Index))
-		{
-			Corners[i] = DensityField[Index];
-		}
-		else
-		{
-			Corners[i] = 1.0f; // Solid by default if out of bounds
-		}
-	}
-	
-	// Get cube configuration
-	int32 CubeIndex = GetCubeConfiguration(Corners);
-	
-	// Skip if cube is entirely inside or outside
-	if (MarchingCubes::EdgeTable[CubeIndex] == 0)
-	{
-		return;
-	}
-	
-	// Find the vertices where the surface intersects the cube
-	FVector VertexList[12];
-	
-	for (int32 i = 0; i < 12; i++)
-	{
-		if (MarchingCubes::EdgeTable[CubeIndex] & (1 << i))
-		{
-			int32 Edge1 = MarchingCubes::EdgeConnections[i][0];
-			int32 Edge2 = MarchingCubes::EdgeConnections[i][1];
-			
-			FVector P1 = FVector(X, Y, Z) + FVector(MarchingCubes::VertexOffsets[Edge1]);
-			FVector P2 = FVector(X, Y, Z) + FVector(MarchingCubes::VertexOffsets[Edge2]);
-			
-			P1 *= VoxelSize;
-			P2 *= VoxelSize;
-			
-			VertexList[i] = InterpolateVertex(P1, P2, Corners[Edge1], Corners[Edge2]);
-		}
-	}
-	
-	// Create triangles based on the configuration
-	for (int32 i = 0; MarchingCubes::TriTable[CubeIndex][i] != -1; i += 3)
-	{
-		int32 V1 = Vertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i]]);
-		int32 V2 = Vertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i + 1]]);
-		int32 V3 = Vertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i + 2]]);
-		
-		// Flip winding so triangles face inward (visible from inside caves)
-		Triangles.Add(V1);
-		Triangles.Add(V3);
-		Triangles.Add(V2);
-	}
-}
-
-void ACaveChunk::MarchCubeToBuffers(int32 X, int32 Y, int32 Z,
-									 const float* DensityData, int32 SampleSize, int32 LocalChunkSize, float LocalVoxelSize,
-									 TArray<FVector>& OutVertices, TArray<int32>& OutTriangles)
-{
-	float Corners[8];
-	for (int32 i = 0; i < 8; i++)
-	{
-		const int32 CornerX = X + MarchingCubes::VertexOffsets[i].X;
-		const int32 CornerY = Y + MarchingCubes::VertexOffsets[i].Y;
-		const int32 CornerZ = Z + MarchingCubes::VertexOffsets[i].Z;
-
-		const int32 Index = CornerX + CornerY * SampleSize + CornerZ * SampleSize * SampleSize;
-
-		const bool bInBounds = (CornerX >= 0 && CornerX <= LocalChunkSize &&
-							  CornerY >= 0 && CornerY <= LocalChunkSize &&
-							  CornerZ >= 0 && CornerZ <= LocalChunkSize);
-		Corners[i] = bInBounds ? DensityData[Index] : 1.0f;
-	}
-
-	const int32 CubeIndex = GetCubeConfiguration(Corners);
-	if (MarchingCubes::EdgeTable[CubeIndex] == 0)
-	{
-		return;
-	}
-
-	FVector VertexList[12];
-	for (int32 i = 0; i < 12; i++)
-	{
-		if (MarchingCubes::EdgeTable[CubeIndex] & (1 << i))
-		{
-			const int32 Edge1 = MarchingCubes::EdgeConnections[i][0];
-			const int32 Edge2 = MarchingCubes::EdgeConnections[i][1];
-			FVector P1 = FVector(X, Y, Z) + FVector(MarchingCubes::VertexOffsets[Edge1]);
-			FVector P2 = FVector(X, Y, Z) + FVector(MarchingCubes::VertexOffsets[Edge2]);
-			P1 *= LocalVoxelSize;
-			P2 *= LocalVoxelSize;
-			VertexList[i] = InterpolateVertex(P1, P2, Corners[Edge1], Corners[Edge2]);
-		}
-	}
-
-	for (int32 i = 0; MarchingCubes::TriTable[CubeIndex][i] != -1; i += 3)
-	{
-		const int32 LocalBase = OutVertices.Num();
-		OutVertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i]]);
-		OutVertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i + 1]]);
-		OutVertices.Add(VertexList[MarchingCubes::TriTable[CubeIndex][i + 2]]);
-
-		// inward-facing winding
-		OutTriangles.Add(LocalBase + 0);
-		OutTriangles.Add(LocalBase + 2);
-		OutTriangles.Add(LocalBase + 1);
-	}
-}
-
-
 void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize, int32 InChunkSize)
 {
 	if (!ProceduralMesh || bIsGenerating)
@@ -576,16 +340,6 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 		TArray<FVector> TempVertices;
 		TArray<int32> TempTriangles;
 		TArray<FVector> TempNormals;
-
-		// Local static helpers to avoid touching UObject state
-		auto InterpolateVertexLocal = [LocalCaveThreshold](const FVector& P1, const FVector& P2, float V1, float V2) -> FVector
-		{
-			if (FMath::Abs(LocalCaveThreshold - V1) < 0.00001f) return P1;
-			if (FMath::Abs(LocalCaveThreshold - V2) < 0.00001f) return P2;
-			if (FMath::Abs(V1 - V2) < 0.00001f) return P1;
-			const float T = (LocalCaveThreshold - V1) / (V2 - V1);
-			return P1 + T * (P2 - P1);
-		};
 
 		const float* DensityPtr = TempDensity.GetData();
 		if (WeakThis.IsValid())
@@ -663,7 +417,7 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 				}
 				Chunk->GenerateUVs();
 				Chunk->ProceduralMesh->CreateMeshSection(0, Chunk->Vertices, Chunk->Triangles, Chunk->Normals,
-					Chunk->UVs, Chunk->VertexColors, Chunk->Tangents, true);
+					Chunk->UVs, TArray<FColor>(), TArray<FProcMeshTangent>(), true);
 
 				if (Chunk->CaveMaterialOverride)
 				{
@@ -691,8 +445,6 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 					Chunk->Triangles.Empty();
 					Chunk->Normals.Empty();
 					Chunk->UVs.Empty();
-					Chunk->VertexColors.Empty();
-					Chunk->Tangents.Empty();
 				}
 				if (!Chunk->bKeepDensityField)
 				{
@@ -703,20 +455,6 @@ void ACaveChunk::GenerateMeshAsync(FIntVector ChunkCoordinate, float InVoxelSize
 			Chunk->bIsGenerating = false;
 		});
 	});
-}
-
-void ACaveChunk::BuildMeshOnGameThread()
-{
-	// This function is called when async generation is complete
-	// For now, it's a no-op since we're using synchronous generation
-}
-
-void ACaveChunk::ModifyTerrain(FVector WorldLocation, float Radius, float Strength)
-{
-	// TODO: Implement terrain modification
-	// This would modify the density field and regenerate the mesh
-	UE_LOG(LogTemp, Warning, TEXT("ModifyTerrain called at %s with radius %f, strength %f"), 
-		   *WorldLocation.ToString(), Radius, Strength);
 }
 
 void ACaveChunk::ResetChunk()
@@ -731,8 +469,6 @@ void ACaveChunk::ResetChunk()
 	Triangles.Empty();
 	Normals.Empty();
 	UVs.Empty();
-	VertexColors.Empty();
-	Tangents.Empty();
 }
 
 void ACaveChunk::SetGenerationSettings(float InNoiseFrequency, int32 InNoiseOctaves, 
@@ -758,15 +494,7 @@ void ACaveChunk::ClearMesh()
 	Triangles.Empty();
 	Normals.Empty();
 	UVs.Empty();
-	VertexColors.Empty();
-	Tangents.Empty();
 	DensityField.Empty();
-}
-
-void ACaveChunk::SetLODLevel(int32 LODLevel)
-{
-	// TODO: Implement LOD system
-	UE_LOG(LogTemp, Warning, TEXT("SetLODLevel called with LOD %d"), LODLevel);
 }
 
 FVector ACaveChunk::InterpolateVertex(FVector P1, FVector P2, float V1, float V2) const
@@ -799,55 +527,6 @@ int32 ACaveChunk::GetCubeConfiguration(float Corners[8]) const
 		}
 	}
 	return CubeIndex;
-}
-
-float ACaveChunk::FractalNoise(FVector Position, int32 Octaves, float Frequency, 
-								 float Lacunarity, float Persistence) const
-{
-	float Value = 0.0f;
-	float Amplitude = 1.0f;
-	float MaxValue = 0.0f;
-	
-	for (int32 i = 0; i < Octaves; i++)
-	{
-		Value += SimplexNoise3D(Position * Frequency) * Amplitude;
-		MaxValue += Amplitude;
-		
-		Frequency *= Lacunarity;
-		Amplitude *= Persistence;
-	}
-	
-	return Value / MaxValue;
-}
-
-void ACaveChunk::CalculateNormals()
-{
-	Normals.SetNum(Vertices.Num());
-
-	// Fast path: with our mesh generation each triangle has unique vertices.
-	// Compute per-face normals in parallel and assign directly.
-	const int32 NumTriangles = Triangles.Num() / 3;
-	ParallelFor(NumTriangles, [this](int32 TriIdx)
-	{
-		const int32 Base = TriIdx * 3;
-		const int32 I1 = Triangles[Base + 0];
-		const int32 I2 = Triangles[Base + 1];
-		const int32 I3 = Triangles[Base + 2];
-
-		if (!Vertices.IsValidIndex(I1) || !Vertices.IsValidIndex(I2) || !Vertices.IsValidIndex(I3))
-		{
-			return;
-		}
-
-		const FVector V1 = Vertices[I1];
-		const FVector V2 = Vertices[I2];
-		const FVector V3 = Vertices[I3];
-		const FVector FaceNormal = FVector::CrossProduct(V2 - V1, V3 - V1).GetSafeNormal();
-
-		Normals[I1] = FaceNormal;
-		Normals[I2] = FaceNormal;
-		Normals[I3] = FaceNormal;
-	});
 }
 
 FVector ACaveChunk::ComputeDensityGradient(const FVector& WorldPosition, float Epsilon) const
@@ -1076,8 +755,6 @@ void ACaveChunk::DeduplicateVertices()
 
 	Normals.Empty();
 	UVs.Empty();
-	VertexColors.Empty();
-	Tangents.Empty();
 }
 
 void ACaveChunk::DeduplicateVerticesWithNormalAveraging()
@@ -1178,8 +855,6 @@ void ACaveChunk::DeduplicateVerticesWithNormalAveraging()
 
 	// Clear other arrays as they need to be recalculated
 	UVs.Empty();
-	VertexColors.Empty();
-	Tangents.Empty();
 }
 
 void ACaveChunk::RemapTriangleIndices(const TArray<int32>& RemapTable)

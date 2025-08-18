@@ -13,9 +13,9 @@
 UCaveWorldSubsystem::UCaveWorldSubsystem()
 {
     // Default settings
-    VoxelSize = 50.0f;
+    VoxelSize = 25.0f;
     ChunkSize = 64;
-    ViewDistance = 5;
+    ViewDistance = 6;
     MaxActiveChunks = 2000;
     ChunksPerFrame = 5;
     bUseAsyncGeneration = true;
@@ -144,48 +144,6 @@ void UCaveWorldSubsystem::UpdateAroundPlayer(FVector PlayerLocation)
     CleanupDistantChunks(RequiredChunks);
 }
 
-void UCaveWorldSubsystem::ModifyTerrainAt(FVector WorldLocation, float Radius, float Strength)
-{
-    // Find affected chunks
-    float ChunkWorldSize = ChunkSize * VoxelSize;
-    int32 ChunkRadius = FMath::CeilToInt(Radius / ChunkWorldSize) + 1;
-    
-    FIntVector CenterChunk = WorldToChunkCoordinate(WorldLocation);
-    
-    // Queue affected chunks for regeneration
-    for (int32 X = -ChunkRadius; X <= ChunkRadius; X++)
-    {
-        for (int32 Y = -ChunkRadius; Y <= ChunkRadius; Y++)
-        {
-            for (int32 Z = -ChunkRadius; Z <= ChunkRadius; Z++)
-            {
-                FIntVector ChunkCoord = CenterChunk + FIntVector(X, Y, Z);
-                
-                // Check if chunk is active
-                if (FChunkData* ChunkData = ActiveChunks.Find(ChunkCoord))
-                {
-                    if (ChunkData->ChunkActor)
-                    {
-                        // Apply modification to chunk
-                        ChunkData->ChunkActor->ModifyTerrain(WorldLocation, Radius, Strength);
-                        
-                        // Mark chunk as dirty
-                        ChunkData->bNeedsRebuild = true;
-                    }
-                }
-            }
-        }
-    }
-}
-
-float UCaveWorldSubsystem::SampleDensityAt(FVector WorldLocation) const
-{
-    // This would normally sample from the density field
-    // For now, return a simple noise-based value
-    float Noise = FMath::PerlinNoise3D(WorldLocation * NoiseFrequency);
-    return Noise;
-}
-
 FIntVector UCaveWorldSubsystem::WorldToChunkCoordinate(FVector WorldLocation) const
 {
     float ChunkWorldSize = ChunkSize * VoxelSize;
@@ -205,7 +163,6 @@ FVector UCaveWorldSubsystem::ChunkToWorldPosition(FIntVector ChunkCoordinate) co
 void UCaveWorldSubsystem::TickUpdate()
 {
     ProcessGenerationQueue();
-    UpdateChunkLODs();
     
     // Debug visualization
     if (bDebugDrawChunkBounds)
@@ -425,39 +382,6 @@ void UCaveWorldSubsystem::CleanupAllChunks()
     ChunkPool.Empty();
 }
 
-void UCaveWorldSubsystem::UpdateChunkLODs()
-{
-    if (!LastPlayerPosition.IsSet())
-    {
-        return;
-    }
-    
-    FVector PlayerPos = LastPlayerPosition.GetValue();
-    
-    for (auto& Pair : ActiveChunks)
-    {
-        FChunkData& ChunkData = Pair.Value;
-        if (ChunkData.ChunkActor)
-        {
-            FVector ChunkCenter = ChunkToWorldPosition(ChunkData.Coordinate) + 
-                                 FVector(ChunkSize * VoxelSize * 50.0f);
-            float Distance = FVector::Distance(PlayerPos, ChunkCenter);
-            
-            // Calculate LOD based on distance
-            int32 TargetLOD = 0;
-            if (Distance > 5000.0f) TargetLOD = 1;
-            if (Distance > 10000.0f) TargetLOD = 2;
-            if (Distance > 20000.0f) TargetLOD = 3;
-            
-            if (ChunkData.CurrentLOD != TargetLOD)
-            {
-                ChunkData.ChunkActor->SetLODLevel(TargetLOD);
-                ChunkData.CurrentLOD = TargetLOD;
-            }
-        }
-    }
-}
-
 float UCaveWorldSubsystem::CalculateChunkPriority(FIntVector ChunkCoordinate) const
 {
     if (!LastPlayerPosition.IsSet())
@@ -496,10 +420,6 @@ void UCaveWorldSubsystem::DrawDebugChunks()
         if (!ChunkData.bIsGenerated)
         {
             DebugColor = FColor::Yellow;
-        }
-        else if (ChunkData.bNeedsRebuild)
-        {
-            DebugColor = FColor::Orange;
         }
         
         // Draw chunk bounds

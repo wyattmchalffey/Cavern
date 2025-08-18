@@ -7,24 +7,14 @@
     {
       "Name": "Cavern",
       "Type": "Runtime",
-      "LoadingPhase": "Default"
+      "LoadingPhase": "Default",
+      "AdditionalDependencies": ["Engine", "ProceduralMeshComponent"]
     }
   ],
   "Plugins": [
     {
-      "Name": "ModelingToolsEditorMode",
+      "Name": "ProceduralMeshComponent",
       "Enabled": true
-    },
-    {
-      "Name": "VisualStudioTools",
-      "Enabled": true,
-      "SupportedTargetPlatforms": [
-        "Win64"
-      ]
     }
-  ],
-  "TargetPlatforms": [],
-  "AdditionalRootDirectories": [],
-  "AdditionalPluginDirectories": [],
-  "EpicSampleNameHash": ""
+  ]
 }
